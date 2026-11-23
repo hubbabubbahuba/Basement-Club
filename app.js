@@ -209,6 +209,10 @@ const tradeSides = t => { const its = S.items.get(t.id) || []; return { give: it
 ===================================================================== */
 // What the site asks Spotify for when you sign in: your recently played songs.
 const SPOTIFY_SCOPES = "user-read-recently-played";
+const SIGNIN_KEY = "basement-club-spotify-signin";
+const b64url = bytes => btoa(String.fromCharCode(...bytes)).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+// Where Spotify sends you back after signing in. Must be listed under Redirect URIs in the Spotify dashboard.
+const spotifyRedirect = () => location.origin + location.pathname.replace(/index\.html$/, "");
 async function spotifyFn(action, args = {}) {
   const { data, error } = await sb.functions.invoke("spotify", { body: { action, ...args } });
   if (error) {
@@ -227,10 +231,19 @@ async function recentPlays() {
   return data;
 }
 const MUSIC = {
+  // Sends you to Spotify's sign-in page. Spotify sends you back here with a one-time code,
+  // which boot() hands to the spotify edge function to finish signing in.
   async signIn() {
     if (DEMO) return sb.auth.signInWithProvider("spotify");
-    // Leaves for Spotify's sign-in page and comes back here.
-    return sb.auth.signInWithOAuth({ provider: "spotify", options: { scopes: SPOTIFY_SCOPES, redirectTo: location.origin + location.pathname } });
+    if (!CONFIG.SPOTIFY_CLIENT_ID || CONFIG.SPOTIFY_CLIENT_ID.includes("YOUR-")) throw err("Add your Spotify Client ID to config.js first (SPOTIFY_CLIENT_ID).");
+    const verifier = b64url(crypto.getRandomValues(new Uint8Array(48)));
+    const challenge = b64url(new Uint8Array(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(verifier))));
+    const state = b64url(crypto.getRandomValues(new Uint8Array(16)));
+    try { sessionStorage.setItem(SIGNIN_KEY, JSON.stringify({ verifier, state })); }
+    catch { throw err("This browser is blocking site storage, so sign-in can't finish. Allow site data for this page and try again."); }
+    location.assign("https://accounts.spotify.com/authorize?" + new URLSearchParams({ client_id: CONFIG.SPOTIFY_CLIENT_ID, response_type: "code",
+      redirect_uri: spotifyRedirect(), scope: SPOTIFY_SCOPES, state, code_challenge_method: "S256", code_challenge: challenge }));
+    return { error: null };
   },
   // Albums from your recent listening, most played first: [{ album, plays }]
   async recentAlbums() {
@@ -2318,7 +2331,6 @@ function demoBar() {
 let signInProblem = "", authUser = null;
 function signInMessage(raw) {
   const t = String(raw).replace(/\+/g, " ");
-  if (/email/i.test(t)) return "Spotify didn't share an email address, and Supabase wants one. See \"If sign-in fails\" in the README.";
   if (/access.?denied|cancel/i.test(t)) return "Spotify sign-in was cancelled.";
   return "Spotify sign-in didn't work: " + t;
 }
@@ -2327,24 +2339,39 @@ async function boot() {
     if (DEMO) { demo = await import("./demo.js"); sb = demo.createDemoClient(); }
     else if (!configured) { go("setup"); return; }
     else {
-      const { createClient } = await import("https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2.45.4/+esm");
-      sb = createClient(CONFIG.SUPABASE_URL, CONFIG.SUPABASE_ANON_KEY, { auth: { persistSession: true, autoRefreshToken: true, detectSessionInUrl: true, flowType: "pkce" } });
+      const { createClient } = await import("https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2.118.0/+esm");
+      sb = createClient(CONFIG.SUPABASE_URL, CONFIG.SUPABASE_ANON_KEY, { auth: { persistSession: true, autoRefreshToken: true, detectSessionInUrl: false } });
     }
     sb.auth.onAuthStateChange(evt => { if (evt === "SIGNED_OUT") S.me = null; });
   }
   demoBar();
   go("loading");
-  // Coming back from Spotify's sign-in page: note any problem, then tidy the address bar.
-  const back = new URLSearchParams(location.search + "&" + location.hash.slice(1));
-  if (back.get("error_description")) signInProblem = signInMessage(back.get("error_description"));
+  // Coming back from Spotify's sign-in page: finish signing in, then tidy the address bar.
+  const back = new URLSearchParams(location.search);
+  if (!DEMO && back.has("state") && (back.has("code") || back.has("error"))) {
+    history.replaceState(null, "", location.pathname);
+    let saved = null;
+    try { saved = JSON.parse(sessionStorage.getItem(SIGNIN_KEY) || "null"); sessionStorage.removeItem(SIGNIN_KEY); } catch { }
+    if (back.get("error")) signInProblem = signInMessage(back.get("error"));
+    else if (!saved || saved.state !== back.get("state")) signInProblem = "That sign-in didn't start on this page, so it was stopped. Try again.";
+    else {
+      try {
+        const t = await spotifyFn("login", { code: back.get("code"), redirect_uri: spotifyRedirect(), code_verifier: saved.verifier });
+        const { error } = await sb.auth.setSession({ access_token: t.access_token, refresh_token: t.refresh_token });
+        if (error) throw err("Signing in didn't finish: " + error.message);
+      } catch (e) { signInProblem = msgOf(e); }
+    }
+  }
   const { data: { session } } = await sb.auth.getSession();
-  if (back.has("code") || back.has("error") || back.has("access_token")) history.replaceState(null, "", location.pathname);
   if (!session) { S.me = null; go("auth"); return; }
   S.me = session.user.id; authUser = session.user;
-  // Right after signing in, Supabase hands over the Spotify sign-in once: keep it on the server for listening data.
-  if (!DEMO && session.provider_refresh_token) spotifyFn("save_token", { refresh_token: session.provider_refresh_token, access_token: session.provider_token }).catch(e => console.warn(e));
   try { await loadAll(); }
-  catch (e) { console.warn(e); $("#main").replaceChildren(h("div", { class: "wrap" }, h("div", { class: "empty" }, h("p", { text: "Couldn't load Basement Club. Reload the page to try again." })))); return; }
+  catch (e) {
+    console.warn(e);
+    $("#main").replaceChildren(h("div", { class: "wrap" }, h("div", { class: "empty" }, h("p", { text: "Couldn't load Basement Club. Reload the page to try again." }),
+      h("p", { class: "muted small", style: "margin-top:8px", text: `Details: ${e?.message || e}${e?.code ? ` (${e.code})` : ""}` }))));
+    return;
+  }
   subscribeLive();
   if (me()?.site_theme || me()?.card_size) { const p = { theme: me().site_theme || currentPrefs().theme, size: me().card_size || currentPrefs().size }; applyPrefs(p); rememberPrefs(p); }
   if (!me()) { go("onboard"); return; }
